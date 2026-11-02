@@ -109,10 +109,8 @@ PYBIND11_MODULE(_infinistore, m) {
         .def_readwrite("minimal_allocate_size", &ServerConfig::minimal_allocate_size)
         .def_readwrite("auto_increase", &ServerConfig::auto_increase)
         .def_readwrite("hint_gid_index", &ServerConfig::hint_gid_index);
-    m.def(
-        "purge_kv_map", []() { kv_map.clear(); }, "purge kv map");
-    m.def(
-        "get_kvmap_len", []() { return kv_map.size(); }, "get kv map size");
+    m.def("purge_kv_map", &purge_kv_map, "purge kv map");
+    m.def("get_kvmap_len", &get_kvmap_len, "get kv map size");
     m.def("register_server", &register_server, "register the server");
     m.def("evict_cache", &evict_cache, "evict the mempool");
 
