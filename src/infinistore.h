@@ -44,5 +44,6 @@ extern std::unordered_map<uintptr_t, boost::intrusive_ptr<PTR>> inflight_rdma_wr
 int register_server(unsigned long loop_ptr, server_config_t config);
 void evict_cache(float min_threshold, float max_threshold);
 void purge_kv_map();
+size_t get_kvmap_len();
 
 #endif

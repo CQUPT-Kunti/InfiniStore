@@ -12,12 +12,20 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <future>
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
+
+#include <boost/lockfree/spsc_queue.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "ibv_helper.h"
 #include "protocol.h"
@@ -52,6 +60,114 @@ static const size_t MAX_SEND_SIZE = 256 << 10;
 const float ON_DEMAND_MIN_THRESHOLD = 0.8;
 const float ON_DEMAND_MAX_THRESHOLD = 0.95;
 
+// ---------------------------------------------------------------------------
+// RDMA 异步流水线
+//
+//   cq_poller (uv loop 线程) --_recv_task_q-----> kv_poller
+//   cq_poller (uv loop 线程) --_rdma_done_q-----> kv_poller
+//   kv_poller                --_rdma_submit_q--> sq_submit_poller
+//   kv_poller                --_ack_q----------> sq_submit_poller
+//
+// 线程所有权：
+//   kv_map / lru_queue / mm 由 kv_poller 独占；
+//   所有 QP 的 SQ 提交由 sq_submit_poller 独占；
+//   uv 相关句柄（含 ibv_post_recv 的 RQ 投递）仍由 uv loop 线程持有。
+// 四个队列的生产者/消费者各自唯一，因此全部是 SPSC。
+// ---------------------------------------------------------------------------
+struct Client;
+typedef struct Client client_t;
+
+struct kv_msg_t {
+    enum kind_t { RECV_REQ, SYNC } kind;
+    client_t *client = nullptr;
+    virtual ~kv_msg_t() = default;
+};
+
+// CQ 的 RECV CQE 对应的请求。recv buffer 会立刻重新投递，所以这里把后续处理
+// 需要的字段全部复制出来，kv_poller 不再引用 recv buffer。
+struct recv_task_t : kv_msg_t {
+    int buf_idx = -1;
+    char op = 0;
+    int block_size = 0;
+    uint32_t rkey = 0;
+    std::vector<std::string> keys;
+    std::vector<uint64_t> remote_addrs;
+    recv_task_t() { kind = RECV_REQ; }
+};
+
+// uv 线程需要在 kv_poller 里做的 KV/mempool 操作（TCP 管理面、mempool 扩容）。
+struct kv_sync_task_t : kv_msg_t {
+    std::function<void()> fn;
+    std::promise<void> done;
+    kv_sync_task_t() { kind = SYNC; }
+};
+
+// CQ 的 RDMA READ/WRITE CQE。wr_id 沿用原来的约定，最后一个批次的 WR 携带
+// 指向 std::vector<PTR> 的指针，其余 WR 的 wr_id 为 0。
+struct rdma_done_t {
+    client_t *client = nullptr;
+    uint64_t wr_id = 0;
+    enum ibv_wc_opcode opcode = IBV_WC_RDMA_READ;
+    enum ibv_wc_status status = IBV_WC_SUCCESS;
+};
+
+// kv_poller 交给 sq_submit_poller 提交的 RDMA 操作，可能分多个批次提交。
+struct rdma_submit_t {
+    client_t *client = nullptr;
+    enum ibv_wr_opcode opcode = IBV_WR_RDMA_READ;
+    uint32_t rkey = 0;
+    std::vector<boost::intrusive_ptr<PTR>> *ops = nullptr;
+    std::vector<uint64_t> remote_addrs;
+    size_t offset = 0;  // 已提交的 key 数
+};
+
+// kv_poller 交给 sq_submit_poller 发送的 ACK。
+struct ack_task_t {
+    client_t *client = nullptr;
+    int return_code = 0;
+};
+
+static boost::lockfree::spsc_queue<kv_msg_t *, boost::lockfree::capacity<8192>> _recv_task_q;
+static boost::lockfree::spsc_queue<rdma_done_t *, boost::lockfree::capacity<8192>> _rdma_done_q;
+static boost::lockfree::spsc_queue<rdma_submit_t *, boost::lockfree::capacity<8192>> _rdma_submit_q;
+static boost::lockfree::spsc_queue<ack_task_t *, boost::lockfree::capacity<8192>> _ack_q;
+
+static std::thread _kv_thread;
+static std::thread _sq_thread;
+static std::atomic<bool> _pipeline_stop{false};
+static std::atomic<bool> _kv_running{false};
+static std::thread::id _kv_thread_id;
+static std::mutex _kv_mu;
+static std::condition_variable _kv_cv;
+static std::mutex _sq_mu;
+static std::condition_variable _sq_cv;
+
+static void kv_poller_loop();
+static void sq_submit_poller_loop();
+static void evict_cache_locked(float min_threshold, float max_threshold);
+
+// 在 kv_poller 线程里执行 fn 并等待结束。只用于低频的 TCP 管理面操作。
+static void run_in_kv_thread(std::function<void()> fn) {
+    if (!_kv_running.load() || std::this_thread::get_id() == _kv_thread_id) {
+        fn();
+        return;
+    }
+
+    kv_sync_task_t *task = new kv_sync_task_t();
+    task->fn = std::move(fn);
+    std::future<void> done = task->done.get_future();
+
+    while (!_recv_task_q.push(task)) {
+        std::this_thread::yield();
+    }
+    _kv_cv.notify_one();
+
+    if (done.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        ERROR("kv_poller did not finish the sync task in time");
+    }
+    delete task;
+}
+
 struct Client {
     uv_tcp_t *handle_ = NULL;    // uv_stream_t
     read_state_t state_;         // state of the client, for parsing the request
@@ -68,8 +184,13 @@ struct Client {
     // RDMA send buffer
     char *send_buffer_ = NULL;
     struct ibv_mr *send_mr_ = NULL;
-    int outstanding_rdma_ops_ = 0;
-    std::deque<std::pair<struct ibv_send_wr *, struct ibv_sge *>> outstanding_rdma_ops_queue_;
+    // 已提交但尚未完成的 SQ WR 数量，由 sq_submit_poller 增加、cq_poller 回收。
+    std::atomic<int> outstanding_rdma_ops_{0};
+
+    // 引用计数：uv 线程持有一份，每个在流水线中的任务再各持有一份。
+    // 最后一个持有者释放时才真正 delete，避免在途任务访问已释放的 Client。
+    std::atomic<int> refs_{1};
+    std::atomic<bool> closing_{false};
 
     // TCP send buffer
     char *tcp_send_buffer_ = NULL;
@@ -89,9 +210,11 @@ struct Client {
     ~Client();
 
     void cq_poll_handle(uv_poll_t *handle, int status, int events);
-    int read_rdma_cache(const RemoteMetaRequest *req);
-    int write_rdma_cache(const RemoteMetaRequest *req);
+    void drain_cq();
+    int read_rdma_cache(recv_task_t *task);
+    int write_rdma_cache(recv_task_t *task);
     void post_ack(int return_code);
+    void post_ack_immediate(int return_code);
     int allocate_rdma(const RemoteMetaRequest *req);
     // send response to client through TCP
     void send_resp(int return_code, void *buf, size_t size);
@@ -103,19 +226,24 @@ struct Client {
     int delete_keys(const DeleteKeysRequest *request);
     int rdma_exchange();
     int prepare_recv_rdma_request(int buf_idx);
-    void perform_batch_rdma(const RemoteMetaRequest *remote_meta_req,
-                            std::vector<boost::intrusive_ptr<PTR>> *inflight_rdma_ops,
-                            enum ibv_wr_opcode opcode);
+    // 在 sq_submit_poller 线程里把 submit 尚未提交的部分尽量提交一批。
+    // 返回实际提交的 key 数，0 表示 SQ 额度不足，负数表示提交失败。
+    int perform_batch_rdma(rdma_submit_t *submit);
+    void handle_rdma_done(rdma_done_t *done);
 };
 
 typedef struct Client client_t;
 
+static void client_retain(client_t *client) { client->refs_.fetch_add(1); }
+
+static void client_release(client_t *client) {
+    if (client->refs_.fetch_sub(1) == 1) {
+        delete client;
+    }
+}
+
 Client::~Client() {
     INFO("free client resources");
-
-    if (poll_handle_.data) {
-        uv_poll_stop(&poll_handle_);
-    }
 
     if (handle_) {
         free(handle_);
@@ -160,7 +288,24 @@ Client::~Client() {
 
 void on_close(uv_handle_t *handle) {
     client_t *client = (client_t *)handle->data;
-    delete client;
+    if (client == nullptr) {
+        return;
+    }
+    handle->data = nullptr;
+
+    // 连接关闭前把 CQ 里剩余的完成事件转到流水线上，让在途任务能正常收尾，
+    // 引用计数才可能归零。
+    client->drain_cq();
+    client->closing_ = true;
+
+    // 停掉 poll 必须发生在 uv loop 线程。
+    if (client->poll_handle_.data) {
+        uv_poll_stop(&client->poll_handle_);
+        client->poll_handle_.data = nullptr;
+    }
+
+    // 只释放 uv 线程这一份引用；在途任务各自持有的引用由它们自己归还。
+    client_release(client);
 }
 
 struct BulkWriteCtx {
@@ -220,7 +365,9 @@ void on_head_write(uv_write_t *req, int status) {
     free(req);
 }
 
-void evict_cache(float min_threshold, float max_threshold) {
+// 真正执行淘汰。kv_map / lru_queue / mm 只属于 kv_poller 线程，因此只能在
+// kv_poller 里调用。
+static void evict_cache_locked(float min_threshold, float max_threshold) {
     if (mm->usage() >= max_threshold) {
         // stop when mm->usage is below min_threshold
         float usage = mm->usage();
@@ -233,45 +380,89 @@ void evict_cache(float min_threshold, float max_threshold) {
     }
 }
 
+// 对外接口：server.py 的 periodic_evict 会在 uv loop 线程里调用它。
+void evict_cache(float min_threshold, float max_threshold) {
+    if (mm == nullptr) {
+        return;
+    }
+    run_in_kv_thread([min_threshold, max_threshold]() {
+        evict_cache_locked(min_threshold, max_threshold);
+    });
+}
+
+void purge_kv_map() {
+    run_in_kv_thread([]() {
+        kv_map.clear();
+        lru_queue.clear();
+    });
+}
+
+size_t get_kvmap_len() {
+    size_t len = 0;
+    run_in_kv_thread([&len]() { len = kv_map.size(); });
+    return len;
+}
+
+// TCP 管理面同样要访问 kv_map / lru_queue / mm，因此统一投递到 kv_poller 执行；
+// uv_write 之类仍然留在 uv loop 线程。
 int Client::tcp_payload_request(const TCPPayloadRequest *req) {
     DEBUG("do tcp_payload_request... {}", op_name(req->op()));
 
     switch (req->op()) {
         case OP_TCP_PUT: {
-            evict_cache(ON_DEMAND_MIN_THRESHOLD, ON_DEMAND_MAX_THRESHOLD);
+            boost::intrusive_ptr<PTR> allocated_ptr;
+            int ret = 0;
 
-            bool allocated =
-                mm->allocate(req->value_length(), 1,
-                             [&](void *addr, uint32_t lkey, uint32_t rkey, int pool_idx) {
-                                 current_tcp_task_ = boost::intrusive_ptr<PTR>(new PTR(
-                                     addr, req->value_length(), pool_idx, req->key()->str()));
-                             });
-            if (!allocated) {
+            run_in_kv_thread([&]() {
+                evict_cache_locked(ON_DEMAND_MIN_THRESHOLD, ON_DEMAND_MAX_THRESHOLD);
+
+                bool allocated = mm->allocate(
+                    req->value_length(), 1,
+                    [&](void *addr, uint32_t lkey, uint32_t rkey, int pool_idx) {
+                        allocated_ptr = boost::intrusive_ptr<PTR>(
+                            new PTR(addr, req->value_length(), pool_idx, req->key()->str()));
+                    });
+                if (!allocated) {
+                    ret = OUT_OF_MEMORY;
+                }
+            });
+
+            if (ret != 0) {
                 ERROR("Failed to allocate memory");
-                return OUT_OF_MEMORY;
+                return ret;
             }
-            DEBUG("allocated memory: addr: {}, lkey: {}, rkey: {}", current_tcp_task_->ptr,
-                  mm->get_lkey(current_tcp_task_->pool_idx),
-                  mm->get_rkey(current_tcp_task_->pool_idx));
 
-            kv_map[req->key()->str()] = current_tcp_task_;
-            // set state machine
+            DEBUG("allocated memory: addr: {}, lkey: {}, rkey: {}", allocated_ptr->ptr,
+                  mm->get_lkey(allocated_ptr->pool_idx), mm->get_rkey(allocated_ptr->pool_idx));
+
+            current_tcp_task_ = allocated_ptr;
+            // 发布到 kv_map 推迟到数据真正收完之后，见 on_read 的 READ_VALUE_THROUGH_TCP
             state_ = READ_VALUE_THROUGH_TCP;
             bytes_read_ = 0;
             expected_bytes_ = req->value_length();
             break;
         }
         case OP_TCP_GET: {
-            auto it = kv_map.find(req->key()->str());
-            if (it == kv_map.end()) {
+            boost::intrusive_ptr<PTR> ptr;
+            bool found = false;
+
+            run_in_kv_thread([&]() {
+                auto it = kv_map.find(req->key()->str());
+                if (it == kv_map.end()) {
+                    return;
+                }
+                found = true;
+                ptr = it->second;
+
+                // move ptr to the end of lru_queue
+                lru_queue.erase(ptr->lru_it);
+                lru_queue.push_back(ptr);
+                ptr->lru_it = --lru_queue.end();
+            });
+
+            if (!found) {
                 return KEY_NOT_FOUND;
             }
-            auto ptr = it->second;
-
-            // move ptr to the end of lru_queue
-            lru_queue.erase(ptr->lru_it);
-            lru_queue.push_back(ptr);
-            ptr->lru_it = --lru_queue.end();
 
             uint32_t *header_buf = (uint32_t *)malloc(sizeof(uint32_t) * 2);
             header_buf[0] = FINISH;
@@ -296,7 +487,23 @@ int Client::tcp_payload_request(const TCPPayloadRequest *req) {
     return 0;
 }
 
+// ACK 也是 SQ 上的 WR，统一交给 sq_submit_poller 提交。
 void Client::post_ack(int return_code) {
+    if (closing_.load()) {
+        return;
+    }
+    ack_task_t *task = new ack_task_t();
+    task->client = this;
+    task->return_code = return_code;
+    client_retain(this);
+    while (!_ack_q.push(task)) {
+        std::this_thread::yield();
+    }
+    _sq_cv.notify_one();
+}
+
+// 真正提交 ACK，只能在 sq_submit_poller 线程里调用。
+void Client::post_ack_immediate(int return_code) {
     // send an error code back
     struct ibv_send_wr wr = {0};
     struct ibv_send_wr *bad_wr = NULL;
@@ -313,8 +520,8 @@ void Client::post_ack(int return_code) {
     }
 }
 
+// cq_poller：只负责收割 CQE 并分发，不做任何 KV / 内存池 / WR 构造工作。
 void Client::cq_poll_handle(uv_poll_t *handle, int status, int events) {
-    // TODO: handle completion
     if (status < 0) {
         ERROR("Poll error: {}", uv_strerror(status));
         return;
@@ -332,122 +539,129 @@ void Client::cq_poll_handle(uv_poll_t *handle, int status, int events) {
         ERROR("Failed to request CQ notification");
         return;
     }
+
     struct ibv_wc wc = {0};
     while (ibv_poll_cq(cq, 1, &wc) > 0) {
-        if (wc.status == IBV_WC_SUCCESS) {
-            if (wc.opcode == IBV_WC_RECV) {  // recv RDMA read/write request
-                const RemoteMetaRequest *request = GetRemoteMetaRequest(recv_buffer_[wc.wr_id]);
+        if (wc.status != IBV_WC_SUCCESS) {
+            ERROR("CQ error: {}, {}", ibv_wc_status_str(wc.status), (unsigned long)wc.wr_id);
+            // RDMA 失败也要让 kv_poller 知道，由它清理未发布的 PTR 并回错误 ACK。
+            if (wc.opcode == IBV_WC_RDMA_READ || wc.opcode == IBV_WC_RDMA_WRITE) {
+                outstanding_rdma_ops_.fetch_sub(MAX_WR_BATCH);
+                _sq_cv.notify_one();
 
-                DEBUG("Received remote meta request OP {}", op_name(request->op()));
-
-                switch (request->op()) {
-                    case OP_RDMA_WRITE: {
-                        int ret = write_rdma_cache(request);
-                        if (ret != 0) {
-                            post_ack(ret);
-                        }
-                        break;
-                    }
-                    case OP_RDMA_READ: {
-                        int ret = read_rdma_cache(request);
-                        if (ret != 0) {
-                            post_ack(ret);
-                        }
-                        break;
-                    }
-                    default:
-                        ERROR("Unexpected request op: {}", request->op());
-                        break;
+                rdma_done_t *done = new rdma_done_t();
+                done->client = this;
+                done->wr_id = wc.wr_id;
+                done->opcode = wc.opcode;
+                done->status = wc.status;
+                client_retain(this);
+                while (!_rdma_done_q.push(done)) {
+                    std::this_thread::yield();
                 }
-
-                DEBUG("ready for next request");
-                if (prepare_recv_rdma_request(wc.wr_id) < 0) {
-                    ERROR("Failed to prepare recv rdma request");
-                    return;
-                }
+                _kv_cv.notify_one();
             }
-            else if (wc.opcode == IBV_WC_SEND) {  // allocate: response sent
-                DEBUG("allocate response sent");
-            }
-            else if (wc.opcode ==
-                     IBV_WC_RECV_RDMA_WITH_IMM) {  // write cache: we already have all data now.
-                // client should not use WRITE_WITH_IMM to notify.
-                // it should use COMMIT message to notify.
-                WARN("WRITE_WITH_IMM is not supported in server side");
-                if (prepare_recv_rdma_request(wc.wr_id) < 0) {
-                    ERROR("Failed to prepare recv rdma request");
-                    return;
-                }
-            }
-            else if (wc.opcode == IBV_WC_RDMA_WRITE || wc.opcode == IBV_WC_RDMA_READ) {
-                // some RDMA write(read cache WRs) is finished
+            continue;
+        }
 
-                assert(outstanding_rdma_ops_ >= 0);
-                outstanding_rdma_ops_ -= MAX_WR_BATCH;
+        if (wc.opcode == IBV_WC_RECV) {  // recv RDMA read/write request
+            const RemoteMetaRequest *request = GetRemoteMetaRequest(recv_buffer_[wc.wr_id]);
 
-                if (!outstanding_rdma_ops_queue_.empty()) {
-                    auto item = outstanding_rdma_ops_queue_.front();
-                    struct ibv_send_wr *wrs = item.first;
-                    struct ibv_sge *sges = item.second;
-                    ibv_send_wr *bad_wr = nullptr;
-                    DEBUG("IBV POST SEND, wr_id: {}", wrs[0].wr_id);
-                    int ret = ibv_post_send(rdma_ctx_.qp, &wrs[0], &bad_wr);
-                    if (ret) {
-                        ERROR("Failed to post RDMA write {}", strerror(ret));
-                        throw std::runtime_error("Failed to post RDMA write");
-                    }
-                    outstanding_rdma_ops_ += MAX_WR_BATCH;
-                    delete[] wrs;
-                    delete[] sges;
-                    outstanding_rdma_ops_queue_.pop_front();
-                }
+            DEBUG("Received remote meta request OP {}", op_name(request->op()));
 
-                if (wc.wr_id > 0) {
-                    // last WR will inform that all RDMA write is finished,so we can dereference PTR
-                    if (wc.opcode == IBV_WC_RDMA_READ) {
-                        auto inflight_rdma_writes =
-                            (std::vector<boost::intrusive_ptr<PTR>> *)wc.wr_id;
-                        for (auto ptr : *inflight_rdma_writes) {
-                            kv_map[ptr->key] = ptr;
-                            DEBUG("writing key done, {}", ptr->key);
-                            lru_queue.push_back(ptr);
-                            ptr->lru_it = --lru_queue.end();
-                        }
-                        delete inflight_rdma_writes;
-                        post_ack(FINISH);
-                    }
-                    else if (wc.opcode == IBV_WC_RDMA_WRITE) {
-                        post_ack(FINISH);
-                        auto inflight_rdma_reads =
-                            (std::vector<boost::intrusive_ptr<PTR>> *)wc.wr_id;
-                        delete inflight_rdma_reads;
-                    }
-                }
+            // 先把元数据复制出来，recv buffer 才能马上重投递。
+            recv_task_t *task = new recv_task_t();
+            task->client = this;
+            task->buf_idx = (int)wc.wr_id;
+            task->op = request->op();
+            task->block_size = request->block_size();
+            task->rkey = request->rkey();
+            task->keys.reserve(request->keys()->size());
+            for (const auto *key : *request->keys()) {
+                task->keys.emplace_back(key->str());
             }
-            else {
-                ERROR("Unexpected wc opcode: {}", (int)wc.opcode);
+            task->remote_addrs.reserve(request->remote_addrs()->size());
+            for (uint32_t i = 0; i < request->remote_addrs()->size(); i++) {
+                task->remote_addrs.push_back(request->remote_addrs()->Get(i));
+            }
+
+            client_retain(this);
+            while (!_recv_task_q.push(task)) {
+                std::this_thread::yield();
+            }
+            _kv_cv.notify_one();
+
+            if (prepare_recv_rdma_request(wc.wr_id) < 0) {
+                ERROR("Failed to prepare recv rdma request");
+                return;
             }
         }
+        else if (wc.opcode == IBV_WC_SEND) {  // allocate: response sent
+            DEBUG("allocate response sent");
+        }
+        else if (wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+            // client should not use WRITE_WITH_IMM to notify.
+            // it should use COMMIT message to notify.
+            WARN("WRITE_WITH_IMM is not supported in server side");
+            if (prepare_recv_rdma_request(wc.wr_id) < 0) {
+                ERROR("Failed to prepare recv rdma request");
+                return;
+            }
+        }
+        else if (wc.opcode == IBV_WC_RDMA_WRITE || wc.opcode == IBV_WC_RDMA_READ) {
+            // SQ 额度在这里归还，然后唤醒可能在等额度的 sq_submit_poller。
+            outstanding_rdma_ops_.fetch_sub(MAX_WR_BATCH);
+            _sq_cv.notify_one();
+
+            rdma_done_t *done = new rdma_done_t();
+            done->client = this;
+            done->wr_id = wc.wr_id;
+            done->opcode = wc.opcode;
+            done->status = wc.status;
+            client_retain(this);
+            while (!_rdma_done_q.push(done)) {
+                std::this_thread::yield();
+            }
+            _kv_cv.notify_one();
+        }
         else {
-            ERROR("CQ error: {}, {}", ibv_wc_status_str(wc.status), wc.wr_id);
+            ERROR("Unexpected wc opcode: {}", (int)wc.opcode);
         }
     }
 }
 
-void add_mempool(uv_work_t *req) { mm->add_mempool(rdma_dev.pd); }
+// 连接关闭时把 CQ 里剩余的完成事件交给 kv_poller 收尾，避免引用计数永远不归零。
+void Client::drain_cq() {
+    if (rdma_ctx_.cq == nullptr) {
+        return;
+    }
+    struct ibv_wc wc = {0};
+    while (ibv_poll_cq(rdma_ctx_.cq, 1, &wc) > 0) {
+        if (wc.opcode != IBV_WC_RDMA_READ && wc.opcode != IBV_WC_RDMA_WRITE) {
+            continue;
+        }
+        outstanding_rdma_ops_.fetch_sub(MAX_WR_BATCH);
 
-void add_mempool_completion(uv_work_t *req, int status) {
-    extend_in_flight = false;
-    mm->need_extend = false;
-    delete req;
+        rdma_done_t *done = new rdma_done_t();
+        done->client = this;
+        done->wr_id = wc.wr_id;
+        done->opcode = wc.opcode;
+        done->status = wc.status;
+        client_retain(this);
+        while (!_rdma_done_q.push(done)) {
+            std::this_thread::yield();
+        }
+        _kv_cv.notify_one();
+    }
 }
 
 void extend_mempool() {
     if (global_config.auto_increase && mm->need_extend && !extend_in_flight) {
         INFO("Extend another mempool");
-        uv_work_t *req = new uv_work_t();
-        uv_queue_work(loop, req, add_mempool, add_mempool_completion);
         extend_in_flight = true;
+        // mempool 归 kv_poller 所有，扩容同样在 kv_poller 里做，避免并发改 mempools_。
+        run_in_kv_thread([]() { mm->add_mempool(rdma_dev.pd); });
+        mm->need_extend = false;
+        extend_in_flight = false;
     }
 }
 
@@ -470,116 +684,87 @@ int Client::prepare_recv_rdma_request(int buf_idx) {
     return 0;
 }
 
-void Client::perform_batch_rdma(const RemoteMetaRequest *remote_meta_req,
-                                std::vector<boost::intrusive_ptr<PTR>> *inflight_rdma_ops,
-                                enum ibv_wr_opcode opcode) {
-    assert(opcode == IBV_WR_RDMA_READ || opcode == IBV_WR_RDMA_WRITE);
+// sq_submit_poller：把 submit 里尚未提交的 key 尽量提交一批。
+// 返回实际提交的 key 数；0 表示 SQ 额度不足（留在 pending 里等 CQE 归还）；
+// 负数表示 ibv_post_send 失败。
+int Client::perform_batch_rdma(rdma_submit_t *submit) {
+    assert(submit->opcode == IBV_WR_RDMA_READ || submit->opcode == IBV_WR_RDMA_WRITE);
 
-    const size_t max_wr = MAX_WR_BATCH;
-    struct ibv_send_wr local_wrs[max_wr];
-    struct ibv_sge local_sges[max_wr];
-
-    struct ibv_send_wr *wrs = local_wrs;
-    struct ibv_sge *sges = local_sges;
-
-    size_t num_wr = 0;
-    bool wr_full = false;
-
-    if (outstanding_rdma_ops_ + max_wr > MAX_RDMA_OPS_WR) {
-        wr_full = true;
-        wrs = new struct ibv_send_wr[max_wr];
-        sges = new struct ibv_sge[max_wr];
+    const size_t total = submit->ops->size();
+    if (submit->offset >= total) {
+        return 0;
     }
 
-    int n = remote_meta_req->keys()->size();
-    for (int i = 0; i < n; i++) {
-        sges[num_wr].addr = (uintptr_t)(*inflight_rdma_ops)[i]->ptr;
-        sges[num_wr].length = (*inflight_rdma_ops)[i]->size;
-        sges[num_wr].lkey = mm->get_lkey((*inflight_rdma_ops)[i]->pool_idx);
+    const size_t remain = total - submit->offset;
+    const size_t batch = std::min(remain, (size_t)MAX_WR_BATCH);
+    const bool last_batch = (submit->offset + batch == total);
 
-        wrs[num_wr].wr_id = 0;
-        wrs[num_wr].opcode = opcode;
-        wrs[num_wr].sg_list = &sges[num_wr];
-        wrs[num_wr].num_sge = 1;
-        wrs[num_wr].wr.rdma.remote_addr = remote_meta_req->remote_addrs()->Get(i);
-        wrs[num_wr].wr.rdma.rkey = remote_meta_req->rkey();
-
-        // wrs[num_wr].wr.rdma.rkey = remote_meta_req->rkey();
-        wrs[num_wr].next = (num_wr == max_wr - 1 || i == (int)remote_meta_req->keys()->size() - 1)
-                               ? nullptr
-                               : &wrs[num_wr + 1];
-
-        wrs[num_wr].send_flags =
-            (num_wr == max_wr - 1 || i == (int)remote_meta_req->keys()->size() - 1)
-                ? IBV_SEND_SIGNALED
-                : 0;
-
-        if (i == remote_meta_req->keys()->size() - 1) {
-            wrs[num_wr].wr_id = (uintptr_t)inflight_rdma_ops;
-        }
-
-        num_wr++;
-
-        if (num_wr == max_wr || i == remote_meta_req->keys()->size() - 1) {
-            if (!wr_full) {
-                struct ibv_send_wr *bad_wr = nullptr;
-                int ret = ibv_post_send(rdma_ctx_.qp, &wrs[0], &bad_wr);
-                if (ret) {
-                    ERROR("Failed to post RDMA write {}", strerror(ret));
-                    return;
-                }
-                outstanding_rdma_ops_ += max_wr;
-
-                // check if next iteration will exceed the limit
-                if (outstanding_rdma_ops_ + max_wr > MAX_RDMA_OPS_WR) {
-                    wr_full = true;
-                }
-            }
-            else {
-                // if WR queue is full, we need to put them into queue
-                WARN(
-                    "WR queue full: push into queue, len: {}, first wr_id: {}, last wr_id: {}, "
-                    "last op code: {} ",
-                    num_wr, wrs[0].wr_id, wrs[num_wr - 1].wr_id,
-                    static_cast<int>(wrs[num_wr - 1].opcode));
-                outstanding_rdma_ops_queue_.push_back({&wrs[0], &sges[0]});
-            }
-
-            if (wr_full) {
-                wrs = new struct ibv_send_wr[max_wr];
-                sges = new struct ibv_sge[max_wr];
-            }
-
-            num_wr = 0;  // Reset the counter for the next batch
-        }
+    if (outstanding_rdma_ops_.load() + (int)MAX_WR_BATCH > MAX_RDMA_OPS_WR) {
+        return 0;
     }
+
+    struct ibv_send_wr wrs[MAX_WR_BATCH] = {};
+    struct ibv_sge sges[MAX_WR_BATCH] = {};
+
+    for (size_t i = 0; i < batch; i++) {
+        const auto &ptr = (*submit->ops)[submit->offset + i];
+
+        sges[i].addr = (uintptr_t)ptr->ptr;
+        sges[i].length = ptr->size;
+        sges[i].lkey = mm->get_lkey(ptr->pool_idx);
+
+        wrs[i].wr_id = 0;
+        wrs[i].opcode = submit->opcode;
+        wrs[i].sg_list = &sges[i];
+        wrs[i].num_sge = 1;
+        wrs[i].wr.rdma.remote_addr = submit->remote_addrs[submit->offset + i];
+        wrs[i].wr.rdma.rkey = submit->rkey;
+        wrs[i].next = (i + 1 == batch) ? nullptr : &wrs[i + 1];
+        // 每批最后一个 WR 需要 signaled，其余 unsignaled，与原实现保持一致。
+        wrs[i].send_flags = (i + 1 == batch) ? IBV_SEND_SIGNALED : 0;
+    }
+
+    // 整个 RPC 的最后一批才携带 wr_id，完成时用它找到整批 PTR。
+    if (last_batch) {
+        wrs[batch - 1].wr_id = (uintptr_t)submit->ops;
+    }
+
+    struct ibv_send_wr *bad_wr = nullptr;
+    int ret = ibv_post_send(rdma_ctx_.qp, &wrs[0], &bad_wr);
+    if (ret) {
+        ERROR("Failed to post RDMA {}: {}",
+              submit->opcode == IBV_WR_RDMA_READ ? "read" : "write", strerror(ret));
+        return -1;
+    }
+
+    outstanding_rdma_ops_.fetch_add(MAX_WR_BATCH);
+    submit->offset += batch;
+    return (int)batch;
 }
 
-int Client::write_rdma_cache(const RemoteMetaRequest *remote_meta_req) {
-    DEBUG("do rdma write... num of keys: {}", remote_meta_req->keys()->size());
+int Client::write_rdma_cache(recv_task_t *task) {
+    DEBUG("do rdma write... num of keys: {}", task->keys.size());
 
-    if (remote_meta_req->keys()->size() != remote_meta_req->remote_addrs()->size()) {
+    if (task->keys.size() != task->remote_addrs.size()) {
         ERROR("keys size and remote_addrs size mismatch");
         return INVALID_REQ;
     }
 
     // allocate memory
-    int block_size = remote_meta_req->block_size();
-    int n = remote_meta_req->keys()->size();
-
-    // create something.
+    int block_size = task->block_size;
+    int n = task->keys.size();
 
     auto *inflight_rdma_writes = new std::vector<boost::intrusive_ptr<PTR>>;
     inflight_rdma_writes->reserve(n);
 
-    evict_cache(ON_DEMAND_MIN_THRESHOLD, ON_DEMAND_MAX_THRESHOLD);
+    evict_cache_locked(ON_DEMAND_MIN_THRESHOLD, ON_DEMAND_MAX_THRESHOLD);
 
     int key_idx = 0;
     bool allocated =
         mm->allocate(block_size, n, [&](void *addr, uint32_t lkey, uint32_t rkey, int pool_idx) {
-            const auto *key = remote_meta_req->keys()->Get(key_idx);
-            auto ptr = boost::intrusive_ptr<PTR>(new PTR(addr, block_size, pool_idx, key->str()));
-            DEBUG("writing key: {}", key->str());
+            const auto &key = task->keys[key_idx];
+            auto ptr = boost::intrusive_ptr<PTR>(new PTR(addr, block_size, pool_idx, key));
+            DEBUG("writing key: {}", key);
             inflight_rdma_writes->push_back(ptr);
             key_idx++;
         });
@@ -590,36 +775,47 @@ int Client::write_rdma_cache(const RemoteMetaRequest *remote_meta_req) {
         return OUT_OF_MEMORY;
     }
 
-    // perform rdma read to receive data from client
-    // read remote address data to local address
-    perform_batch_rdma(remote_meta_req, inflight_rdma_writes, IBV_WR_RDMA_READ);
+    // 数据要先拉下来才算写入成功，这里只把 RDMA READ 交给 sq_submit_poller。
+    auto *submit = new rdma_submit_t();
+    submit->client = this;
+    submit->opcode = IBV_WR_RDMA_READ;
+    submit->rkey = task->rkey;
+    submit->ops = inflight_rdma_writes;
+    submit->remote_addrs = task->remote_addrs;
+
+    client_retain(this);
+    while (!_rdma_submit_q.push(submit)) {
+        std::this_thread::yield();
+    }
+    _sq_cv.notify_one();
 
     return 0;
 }
 
-int Client::read_rdma_cache(const RemoteMetaRequest *remote_meta_req) {
-    DEBUG("do rdma read... num of keys: {}", remote_meta_req->keys()->size());
+int Client::read_rdma_cache(recv_task_t *task) {
+    DEBUG("do rdma read... num of keys: {}", task->keys.size());
 
-    if (remote_meta_req->keys()->size() != remote_meta_req->remote_addrs()->size()) {
+    if (task->keys.size() != task->remote_addrs.size()) {
         ERROR("keys size and remote_addrs size mismatch");
         return INVALID_REQ;
     }
 
     auto *inflight_rdma_reads = new std::vector<boost::intrusive_ptr<PTR>>;
+    inflight_rdma_reads->reserve(task->keys.size());
 
-    inflight_rdma_reads->reserve(remote_meta_req->keys()->size());
-
-    for (const auto *key : *remote_meta_req->keys()) {
-        auto it = kv_map.find(key->str());
+    for (const auto &key : task->keys) {
+        auto it = kv_map.find(key);
         if (it == kv_map.end()) {
-            WARN("Key not found: {}", key->str());
+            WARN("Key not found: {}", key);
+            delete inflight_rdma_reads;
             return KEY_NOT_FOUND;
         }
         const auto &ptr = it->second;
 
-        if (ptr->size > remote_meta_req->block_size()) {
+        if (ptr->size > (size_t)task->block_size) {
             WARN("remote region does not enough size: key:{}, actual size: {}, remote size :{}",
-                 key->str(), ptr->size, remote_meta_req->block_size());
+                 key, ptr->size, task->block_size);
+            delete inflight_rdma_reads;
             return INVALID_REQ;
         }
 
@@ -627,16 +823,66 @@ int Client::read_rdma_cache(const RemoteMetaRequest *remote_meta_req) {
     }
 
     // loop over inflight_rdma_reads to update lru_queue
-    for (auto ptr : *inflight_rdma_reads) {
+    for (auto &ptr : *inflight_rdma_reads) {
         lru_queue.erase(ptr->lru_it);
         lru_queue.push_back(ptr);
         ptr->lru_it = --lru_queue.end();
     }
 
-    // write to  remote address data from local address
-    perform_batch_rdma(remote_meta_req, inflight_rdma_reads, IBV_WR_RDMA_WRITE);
+    // write to remote address data from local address
+    auto *submit = new rdma_submit_t();
+    submit->client = this;
+    submit->opcode = IBV_WR_RDMA_WRITE;
+    submit->rkey = task->rkey;
+    submit->ops = inflight_rdma_reads;
+    submit->remote_addrs = task->remote_addrs;
+
+    client_retain(this);
+    while (!_rdma_submit_q.push(submit)) {
+        std::this_thread::yield();
+    }
+    _sq_cv.notify_one();
 
     return 0;
+}
+
+// kv_poller：处理 RDMA 完成事件。只有整个 RPC 的最后一批才带 wr_id，
+// 因此中间的批次到这里只做资源归还。
+void Client::handle_rdma_done(rdma_done_t *done) {
+    if (done->status != IBV_WC_SUCCESS) {
+        ERROR("RDMA operation failed: {}, wr_id: {}", ibv_wc_status_str(done->status),
+              (unsigned long)done->wr_id);
+        if (done->wr_id > 0) {
+            // 传输失败：不发布到 kv_map，PTR 析构时把内存还给 mempool。
+            auto *ops = (std::vector<boost::intrusive_ptr<PTR>> *)done->wr_id;
+            delete ops;
+            post_ack(INTERNAL_ERROR);
+        }
+        return;
+    }
+
+    if (done->wr_id == 0) {
+        return;
+    }
+
+    auto *ops = (std::vector<boost::intrusive_ptr<PTR>> *)done->wr_id;
+
+    if (done->opcode == IBV_WC_RDMA_READ) {
+        // 数据已经落到本地内存，这时才发布到 kv_map，避免别的请求读到半成品。
+        for (auto &ptr : *ops) {
+            kv_map[ptr->key] = ptr;
+            DEBUG("writing key done, {}", ptr->key);
+            lru_queue.push_back(ptr);
+            ptr->lru_it = --lru_queue.end();
+        }
+        delete ops;
+        post_ack(FINISH);
+    }
+    else if (done->opcode == IBV_WC_RDMA_WRITE) {
+        // 下载：数据已推给 client，可以释放本次持有的 PTR 引用。
+        delete ops;
+        post_ack(FINISH);
+    }
 }
 
 // FIXME:
@@ -769,14 +1015,9 @@ void Client::send_resp(int return_code, void *buf, size_t size) {
 }
 
 int Client::check_key(const std::string &key_to_check) {
-    int ret;
+    int ret = 1;
     // check if the key exists and committed
-    if (kv_map.count(key_to_check) > 0) {
-        ret = 0;
-    }
-    else {
-        ret = 1;
-    }
+    run_in_kv_thread([&]() { ret = kv_map.count(key_to_check) > 0 ? 0 : 1; });
 
     send_resp(FINISH, &ret, sizeof(ret));
     reset_client_read_state();
@@ -784,18 +1025,22 @@ int Client::check_key(const std::string &key_to_check) {
 }
 
 int Client::get_match_last_index(const GetMatchLastIndexRequest *request) {
-    int left = 0, right = request->keys()->size();
-    while (left < right) {
-        int mid = left + (right - left) / 2;
-        request->keys()->Get(mid);
-        if (kv_map.count(request->keys()->Get(mid)->str())) {
-            left = mid + 1;
+    int left = 0;
+    run_in_kv_thread([&]() {
+        int l = 0, r = request->keys()->size();
+        while (l < r) {
+            int mid = l + (r - l) / 2;
+            request->keys()->Get(mid);
+            if (kv_map.count(request->keys()->Get(mid)->str())) {
+                l = mid + 1;
+            }
+            else {
+                r = mid;
+            }
         }
-        else {
-            right = mid;
-        }
-    }
-    left--;
+        left = l - 1;
+    });
+
     send_resp(FINISH, &left, sizeof(left));
     reset_client_read_state();
     return 0;
@@ -817,15 +1062,18 @@ int Client::get_match_last_index(const GetMatchLastIndexRequest *request) {
  **/
 int Client::delete_keys(const DeleteKeysRequest *request) {
     int count = 0;
-    for (const auto *key : *request->keys()) {
-        auto it = kv_map.find(key->str());
-        if (it != kv_map.end()) {
-            auto ptr = it->second;
-            kv_map.erase(it);
-            lru_queue.erase(ptr->lru_it);
-            count++;
+    run_in_kv_thread([&]() {
+        for (const auto *key : *request->keys()) {
+            auto it = kv_map.find(key->str());
+            if (it != kv_map.end()) {
+                auto ptr = it->second;
+                kv_map.erase(it);
+                lru_queue.erase(ptr->lru_it);
+                count++;
+            }
         }
-    }
+    });
+
     send_resp(FINISH, &count, sizeof(count));
     reset_client_read_state();
     return 0;
@@ -947,16 +1195,18 @@ void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
                 offset += to_copy;
                 if (client->bytes_read_ == client->expected_bytes_) {
                     auto ptr = client->current_tcp_task_;
-                    kv_map[ptr->key] = ptr;
-
-                    // put the ptr into lru queue
-                    lru_queue.push_back(ptr);
-                    ptr->lru_it = --lru_queue.end();
+                    // kv_map / lru_queue 归 kv_poller 所有，发布动作投递过去执行。
+                    run_in_kv_thread([&ptr]() {
+                        kv_map[ptr->key] = ptr;
+                        lru_queue.push_back(ptr);
+                        ptr->lru_it = --lru_queue.end();
+                    });
 
                     client->current_tcp_task_.reset();
                     client->send_resp(FINISH, NULL, 0);
                     client->reset_client_read_state();
                 }
+                break;
             }
         }
     }
@@ -985,6 +1235,179 @@ void on_new_connection(uv_stream_t *server, int status) {
     else {
         uv_close((uv_handle_t *)client_handle, NULL);
     }
+}
+
+// kv_poller：独占 kv_map / lru_queue / mm，消费 _recv_task_q 和 _rdma_done_q。
+static void kv_poller_loop() {
+    _kv_thread_id = std::this_thread::get_id();
+
+    while (!_pipeline_stop.load()) {
+        bool did_work = false;
+
+        // 完成事件优先处理：尽快发布数据并回 ACK。
+        rdma_done_t *done = nullptr;
+        int budget = 512;
+        while (budget-- > 0 && _rdma_done_q.pop(done)) {
+            did_work = true;
+            done->client->handle_rdma_done(done);
+            client_release(done->client);
+            delete done;
+        }
+
+        // 再处理新到的请求。
+        kv_msg_t *msg = nullptr;
+        budget = 128;
+        while (budget-- > 0 && _recv_task_q.pop(msg)) {
+            did_work = true;
+            if (msg->kind == kv_msg_t::RECV_REQ) {
+                recv_task_t *task = static_cast<recv_task_t *>(msg);
+                client_t *client = task->client;
+
+                if (client->closing_.load()) {
+                    client_release(client);
+                    delete task;
+                    continue;
+                }
+
+                int ret = 0;
+                switch (task->op) {
+                    case OP_RDMA_WRITE: {
+                        ret = client->write_rdma_cache(task);
+                        break;
+                    }
+                    case OP_RDMA_READ: {
+                        ret = client->read_rdma_cache(task);
+                        break;
+                    }
+                    default:
+                        ERROR("Unexpected request op: {}", task->op);
+                        ret = INVALID_REQ;
+                        break;
+                }
+
+                if (ret != 0) {
+                    client->post_ack(ret);
+                }
+                client_release(client);
+                delete task;
+            }
+            else {
+                // 同步任务：执行完只唤醒等待方，task 由等待方释放。
+                kv_sync_task_t *sync = static_cast<kv_sync_task_t *>(msg);
+                sync->fn();
+                sync->done.set_value();
+            }
+        }
+
+        if (!did_work) {
+            std::unique_lock<std::mutex> lock(_kv_mu);
+            while (!_pipeline_stop.load() && _recv_task_q.empty() && _rdma_done_q.empty()) {
+                if (_kv_cv.wait_for(lock, std::chrono::milliseconds(2)) ==
+                    std::cv_status::timeout) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// sq_submit_poller：独占所有 QP 的 SQ，消费 _rdma_submit_q 和 _ack_q。
+static void sq_submit_poller_loop() {
+    std::deque<rdma_submit_t *> pending;
+
+    while (!_pipeline_stop.load()) {
+        bool did_work = false;
+
+        // ACK 优先，别让 client 等 ACK。
+        ack_task_t *ack = nullptr;
+        while (_ack_q.pop(ack)) {
+            did_work = true;
+            ack->client->post_ack_immediate(ack->return_code);
+            client_release(ack->client);
+            delete ack;
+        }
+
+        // 提交 RDMA，额度不足就停下等 CQE 归还。
+        while (true) {
+            if (pending.empty()) {
+                rdma_submit_t *submit = nullptr;
+                if (!_rdma_submit_q.pop(submit)) {
+                    break;
+                }
+                pending.push_back(submit);
+            }
+
+            rdma_submit_t *submit = pending.front();
+            if (submit->ops->empty()) {
+                pending.pop_front();
+                client_release(submit->client);
+                delete submit->ops;
+                delete submit;
+                continue;
+            }
+
+            int submitted = submit->client->perform_batch_rdma(submit);
+
+            if (submitted < 0) {
+                // 提交失败：交给 kv_poller 做失败清理（不发布数据、回错误 ACK）。
+                pending.pop_front();
+                rdma_done_t *done = new rdma_done_t();
+                done->client = submit->client;
+                done->wr_id = (uintptr_t)submit->ops;
+                done->opcode = submit->opcode == IBV_WR_RDMA_READ ? IBV_WC_RDMA_READ
+                                                                  : IBV_WC_RDMA_WRITE;
+                done->status = IBV_WC_LOC_PROT_ERR;
+                client_retain(done->client);
+                while (!_rdma_done_q.push(done)) {
+                    std::this_thread::yield();
+                }
+                _kv_cv.notify_one();
+
+                client_release(submit->client);
+                delete submit;
+                continue;
+            }
+
+            if (submitted == 0) {
+                break;  // SQ 额度已经用满
+            }
+
+            did_work = true;
+            if (submit->offset >= submit->ops->size()) {
+                pending.pop_front();
+                // ops 已经交给 wr_id，完成事件里由 kv_poller 释放。
+                client_release(submit->client);
+                delete submit;
+            }
+        }
+
+        if (!did_work) {
+            std::unique_lock<std::mutex> lock(_sq_mu);
+            while (!_pipeline_stop.load() && _ack_q.empty() && _rdma_submit_q.empty()) {
+                if (_sq_cv.wait_for(lock, std::chrono::milliseconds(2)) ==
+                    std::cv_status::timeout) {
+                    break;
+                }
+            }
+        }
+    }
+
+    for (auto *submit : pending) {
+        delete submit->ops;
+        client_release(submit->client);
+        delete submit;
+    }
+    pending.clear();
+}
+
+static void start_pipeline() {
+    // uv 线程是 _recv_task_q 的唯一生产者，kv_poller 是唯一消费者，SPSC 成立。
+    _kv_running.store(true);
+    _kv_thread = std::thread(kv_poller_loop);
+    _kv_thread.detach();
+
+    _sq_thread = std::thread(sq_submit_poller_loop);
+    _sq_thread.detach();
 }
 
 int register_server(unsigned long loop_ptr, server_config_t config) {
@@ -1022,6 +1445,8 @@ int register_server(unsigned long loop_ptr, server_config_t config) {
         return -1;
     }
     mm = new MM(config.prealloc_size << 30, config.minimal_allocate_size << 10, rdma_dev.pd);
+
+    start_pipeline();
 
     INFO("register server done");
 
